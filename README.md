@@ -2,8 +2,7 @@
 
 This repository contains the official implementation of the paper:
 
-**"Co-synthesis of Histopathology Nuclei Image-Label Pairs using a Context-Conditioned Joint Diffusion Model"**  
-Accepted at ECCV 2024
+**"Co-synthesis of Histopathology Nuclei Image-Label Pairs using a Context-Conditioned Joint Diffusion Model" (ECCV2024)**  
 
 ### Overview
 
