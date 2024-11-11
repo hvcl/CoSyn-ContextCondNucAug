@@ -1,8 +1,10 @@
-# CoSyn: Context-Conditioned Joint Diffusion Model for Histopathology Nuclei Image-Label Pair Synthesis
+# CoSyn: Context-Conditioned Joint Diffusion Model for Histopathology Nuclei Image-Label Pair Synthesis [ECCV2024](https://link.springer.com/chapter/10.1007/978-3-031-72624-8_9)
 
 This repository contains the official implementation of the paper:
 
-**"Co-synthesis of Histopathology Nuclei Image-Label Pairs using a Context-Conditioned Joint Diffusion Model" (ECCV2024)**  
+**"Co-synthesis of Histopathology Nuclei Image-Label Pairs using a Context-Conditioned Joint Diffusion Model"**  
+
+Arxiv version: [Paper](https://arxiv.org/abs/2407.14434)
 
 ### Overview
 
