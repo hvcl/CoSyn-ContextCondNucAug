@@ -21,6 +21,7 @@ We introduce a novel framework for co-synthesizing histopathology nuclei images 
 git clone https://github.com/yourusername/CoSyn-ContextCondNucAug.git
 cd CoSyn-ContextCondNucAug
 pip install -r requirements.txt
+```
 
 ### Acknowledgements
 
