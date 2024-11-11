@@ -26,7 +26,7 @@ pip install -r requirements.txt
 ### Acknowledgements
 
 We would like to acknowledge the following projects that have contributed to our work:
-This project is built upon the work of [GCDP (Generative Contextual Descriptor Prediction)](https://github.com/pmh9960/GCDP). We thank the authors for making their code available.
+This project is built upon the work of [GCDP](https://github.com/pmh9960/GCDP). We thank the authors for making their code available.
 
 ### Citation
 If you find this work useful in your research, please consider citing our paper:
