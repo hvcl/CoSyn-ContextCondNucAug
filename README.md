@@ -7,6 +7,12 @@ This repository contains the official implementation of the paper:
 - ECCV version: [Paper](https://link.springer.com/chapter/10.1007/978-3-031-72624-8_9)
 - Arxiv version: [Paper](https://arxiv.org/abs/2407.14434)
 
+### News
+
+Feb. 17, 2025
+- Updated train.py, test.py , datasets/, imagen_pytorch/ directories
+- Uploaded python code for creating both point centroids (.png) and distance maps (.npy): preprocess/generate_point_and_distmap.py
+
 ### Overview
 
 We introduce a novel framework for co-synthesizing histopathology nuclei images and paired semantic labels using a context-conditioned joint diffusion model. Our method addresses the challenge of limited training data in multi-class histopathology nuclei analysis tasks by generating high-quality synthetic samples that incorporate spatial and structural context information.
