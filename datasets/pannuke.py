@@ -134,7 +134,7 @@ class PannukeDataset(Dataset):
                 RandomHorizontalFlip(p=0.5),
                 # ToTensor(),
             ])
-        elif 'lizard' in augmentation_type:
+        elif 'pannuke' in augmentation_type:
             self.augmentation = Compose([
                 # Resize((500, 500), interpolation=InterpolationMode.NEAREST),
                 # RandomCrop((side_x, side_y)),
