@@ -7,23 +7,24 @@ This repository contains the official implementation of the paper:
 - ECCV version: [Paper](https://link.springer.com/chapter/10.1007/978-3-031-72624-8_9)
 - Arxiv version: [Paper](https://arxiv.org/abs/2407.14434)
 
-### News
+## News
 
 Feb. 17, 2025
 - Updated train.py, test.py , datasets/, imagen_pytorch/ directories
 - Uploaded python code for creating both point centroids (.png) and distance maps (.npy): preprocess/generate_point_and_distmap.py
+- Now available to use the checkpoints
 
-### Overview
+## Overview
 
 We introduce a novel framework for co-synthesizing histopathology nuclei images and paired semantic labels using a context-conditioned joint diffusion model. Our method addresses the challenge of limited training data in multi-class histopathology nuclei analysis tasks by generating high-quality synthetic samples that incorporate spatial and structural context information.
 
-### Key Features
+## Key Features
 
 - Context-conditioned diffusion model using nucleus centroid layouts and structure-related text prompts
 - Concurrent synthesis of images, semantic labels, and distance maps for instance-wise nuclei labels
 - Demonstrated effectiveness on multi-institutional, multi-organ, and multi-modality datasets
 
-### Installation
+## Installation
 
 ```bash
 git clone https://github.com/yourusername/CoSyn-ContextCondNucAug.git
@@ -31,12 +32,19 @@ cd CoSyn-ContextCondNucAug
 pip install -r requirements.txt
 ```
 
-### Acknowledgements
+## Checkpoints
+
+[Checkpoints](https://drive.google.com/drive/folders/15ZN6AYDChWQNrSCBE6bVK9vbz3kytzM5?usp=drive_link)
+- lizard
+- endonuke
+- pannuke
+
+## Acknowledgements
 
 We would like to acknowledge the following projects that have contributed to our work:
 This project is built upon the work of [GCDP](https://github.com/pmh9960/GCDP). We thank the authors for making their code available.
 
-### Citation
+## Citation
 If you find this work useful in your research, please consider citing our paper:
 ```bibtex
 @InProceedings{10.1007/978-3-031-72624-8_9,
