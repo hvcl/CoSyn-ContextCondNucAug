@@ -13,28 +13,21 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose, InterpolationMode, RandomCrop, RandomHorizontalFlip, RandomVerticalFlip, Resize, ToTensor
 
-PanNukeClass = namedtuple('PanNukeClass', ['name', 'id', 'has_instances', 'color'])
-# autopep8: off
+PannukeClass = namedtuple('PannukeClass', ['name', 'id', 'has_instances', 'color'])
 classes = [
-    PanNukeClass('Background',         0, True,  (  0,   0,   0)), # black
-    PanNukeClass('Neoplastic',         1, True,  (250, 170, 160)), # peach
-    PanNukeClass('Inflammatory',       2, True,  (164, 164, 238)), # light purple
-    PanNukeClass('Connective_tissue',  3, True,  ( 51,  51, 255)), # blue
-    PanNukeClass('Dead',               4, True,  (231, 205,  13)), # yellow
-    PanNukeClass('Epithelial',         5, True,  ( 76, 153,   0)), # green / Non_Neoplastic_Epithelial
+    PannukeClass('Background',                  0, True,  (  0,   0,   0)), # black
+    PannukeClass('Inflammatory',                1, True,  (250, 170, 160)), # peach
+    PannukeClass('Connective tissue',           2, True,  ( 51,  51, 255)), # blue
+    PannukeClass('Dead',                        3, True,  (164, 164, 238)), # light purple
+    PannukeClass('Non-neoplastic epithelial',   4, True,  ( 76, 153,   0)), # green
+    PannukeClass('Neoplastic',                  5, True,  (231, 205,  13)), # yellow
 ]
-# classes = [
-#     PanNukeClass('Background',         0, True,  (  0,   0,   0)), # black
-#     PanNukeClass('Neoplastic',         1, True,  (250, 170, 160)), # peach (250, 170, 160)
-#     PanNukeClass('Inflammatory',       2, True,  (  0, 244, 238)), # cyan
-#     PanNukeClass('Connective_tissue',  3, True,  ( 51,  51, 255)), # blue
-#     PanNukeClass('Dead',               4, True,  (248, 242,   0)), # yellow
-#     PanNukeClass('Epithelial',         5, True,  ( 76, 153,   0)), # green / Non_Neoplastic_Epithelial
-# ]
 # autopep8: on
 num_classes = 6
 mapping_id = torch.tensor([x.id for x in classes])
 colors = torch.tensor([cls.color for cls in classes])
+
+INSTANCE_CLASSES = ['', 'inflammatory', 'connective tissue', 'dead', 'non-neoplastic epithelial', 'neoplastic']
 
 
 def normalize_to_neg_one_to_one(img):
@@ -98,7 +91,7 @@ def read_jsonl(jsonl_path):
     return lines
 
 
-class PanNukeDataset(Dataset):
+class PannukeDataset(Dataset):
     def __init__(
         self,
         root="",
@@ -112,6 +105,8 @@ class PanNukeDataset(Dataset):
         self.root = Path(root)
         self.image_dir = os.path.join(self.root, 'images', split)
         self.label_dir = os.path.join(self.root, 'classes', split)
+        self.point_dir = os.path.join(self.root, 'points', split)
+        self.dist_dir = os.path.join(self.root, 'distances', split)
 
         self.split = split
         self.shuffle = shuffle
@@ -139,7 +134,7 @@ class PanNukeDataset(Dataset):
                 RandomHorizontalFlip(p=0.5),
                 # ToTensor(),
             ])
-        elif 'pannuke' in augmentation_type:
+        elif 'lizard' in augmentation_type:
             self.augmentation = Compose([
                 # Resize((500, 500), interpolation=InterpolationMode.NEAREST),
                 # RandomCrop((side_x, side_y)),
@@ -155,10 +150,16 @@ class PanNukeDataset(Dataset):
                               if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
         self.labels = sorted([osp.join(self.label_dir, file) for file in os.listdir(self.label_dir)
                               if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
+        self.points = sorted([osp.join(self.point_dir, file) for file in os.listdir(self.point_dir)
+                              if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
+        self.dists = sorted([osp.join(self.dist_dir, file) for file in os.listdir(self.dist_dir)
+                              if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
 
-        assert len(self.images) == len(self.labels), f'{len(self.images)} != {len(self.labels)}'
-        # for img, lbl in zip(self.images, self.labels):
-        #     assert osp.splitext(osp.basename(img))[0] == osp.splitext(osp.basename(lbl))[0]
+        assert len(self.images) == len(self.labels) == len(self.points) == len(self.dists), f'{len(self.images)} != {len(self.labels)} != {len(self.points)} != {len(self.dists)}'
+        for img, lbl, pnt, dist in zip(self.images, self.labels, self.points, self.dists):
+            assert osp.splitext(osp.basename(img))[0][4:] == osp.splitext(osp.basename(lbl))[0][4:]
+            assert osp.splitext(osp.basename(img))[0][4:] == osp.splitext(osp.basename(pnt))[0][4:]
+            assert osp.splitext(osp.basename(img))[0][4:] == osp.splitext(osp.basename(dist))[0][4:]
 
     def __len__(self):
         return len(self.images)
@@ -176,11 +177,43 @@ class PanNukeDataset(Dataset):
             return self.random_sample()
         return self.sequential_sample(ind=ind)
 
+    def set_prompt(self, cls, tissue_type):
+        if tissue_type == "adrenal":
+            tissue_type = "adrenal gland"
+        elif tissue_type == "headneck":
+            tissue_type = "head and neck"
+        elif tissue_type == "bile-duct":
+            tissue_type = "bile duct"
+        prompt = f"high quality histopathology {tissue_type} tissue image"
+        cls_now = np.unique(cls)
+        # shuffle classes and add to prompt
+        if len(cls_now)==1:
+            prompt += " with no nucleus"
+        else:
+            prompt += " including nuclei types of "
+            included = []
+            for i in cls_now[1:]:
+                included.append(INSTANCE_CLASSES[int(i)])
+            random.shuffle(included)
+            if len(included) > 1:
+                included[-1] = "and " + included[-1]
+                if len(included)==2:
+                    included = ' '.join(included)
+                else:
+                    included = ', '.join(included)
+            else:
+                included = included[0]
+            prompt += included
+        return prompt
+
     def __getitem__(self, idx):
         # load image
         try:
-            original_pil_image = Image.open(self.images[idx]).convert("RGB")
+            original_pil_image  = Image.open(self.images[idx]).convert("RGB")
             original_pil_target = Image.open(self.labels[idx])
+            original_pil_point  = Image.open(self.points[idx])
+            original_pil_dist   = Image.open(self.dists[idx])
+            tissue_type = osp.splitext(osp.basename(self.images[idx]))[0][4:].split("_")[0].lower()
         except (OSError, ValueError) as e:
             print(f"An exception occurred trying to load file {self.images[idx]}.")
             print(f"Skipping index {idx}")
@@ -189,12 +222,18 @@ class PanNukeDataset(Dataset):
         # Transforms
         image = ToTensor()(original_pil_image)
         label = ToTensorNoNorm()(original_pil_target).float()
-        img_lbl = self.augmentation(torch.cat([image, label]))
+        point = ToTensorNoNorm()(original_pil_point).float()
+        dist = ToTensor()(original_pil_dist).float()
+        img_dist_lbl_pnt = self.augmentation(torch.cat([image, dist, label, point])) # 0,1,2: image, 3: dist, 4: label, 5:point
+        
+        aug_img_dist = img_dist_lbl_pnt[:4]
+        aug_lbl = img_dist_lbl_pnt[4].unsqueeze(0)
+        aug_pnt = img_dist_lbl_pnt[5].unsqueeze(0)
 
-        caption = img_lbl[3:] # caption 자리에 뭐라도 넣어야 돌아감
-
-        return img_lbl[:3], img_lbl[3:], caption
-
+        caption = self.set_prompt(label, tissue_type)
+        
+        # img, label, caption, point
+        return aug_img_dist, aug_lbl, caption, aug_pnt
 
 def transform_lbl(lbl: torch.Tensor, *args, **kwargs):
     lbl = lbl.long()
@@ -204,3 +243,37 @@ def transform_lbl(lbl: torch.Tensor, *args, **kwargs):
     rgbs = colors[lbl]
     rgbs = rgbs.permute(0, 3, 1, 2)
     return rgbs / 255.
+
+
+def get_text(cls, tissue_type):
+    if tissue_type == "adrenal":
+        tissue_type = "adrenal gland"
+    elif tissue_type == "headneck":
+        tissue_type = "head and neck"
+    elif tissue_type == "bile-duct":
+        tissue_type = "bile duct"
+    prompt = f"high quality histopathology {tissue_type} tissue image"
+    cls_now = np.unique(cls)
+    # shuffle classes and add to prompt
+    if len(cls_now)==1:
+        prompt += " with no nucleus"
+    else:
+        prompt += " including nuclei types of "
+        included = []
+        for i in cls_now[1:]:
+            included.append(INSTANCE_CLASSES[int(i)])
+        random.shuffle(included)
+        if len(included) > 1:
+            included[-1] = "and " + included[-1]
+            if len(included)==2:
+                included = ' '.join(included)
+            else:
+                included = ', '.join(included)
+        else:
+            included = included[0]
+        prompt += included
+    return prompt
+
+
+a = PannukeDataset()
+b = a.random_sample()

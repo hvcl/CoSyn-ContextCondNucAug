@@ -14,22 +14,20 @@ from torch.utils.data import Dataset
 from torchvision.transforms import Compose, InterpolationMode, RandomCrop, RandomHorizontalFlip, RandomVerticalFlip, Resize, ToTensor
 
 LizardClass = namedtuple('LizardClass', ['name', 'id', 'has_instances', 'color'])
-# autopep8: off
 classes = [
-    LizardClass('background',         0, True,  (  0,   0,   0)), # black
+    LizardClass('Background',         0, True,  (  0,   0,   0)), # black
     LizardClass('Neutrophil',         1, True,  (204,   0,   0)), # red
-    LizardClass('Epithelial',         2, True,  (  76, 153,   0)), # green
-    LizardClass('Lymphocyte',         3, True,  (255, 153, 51)), # orange
-    LizardClass('Plasma',             4, True,  (153, 76,   255)), # purple
-    # LizardClass('Neutrophil',         5, True,  (255,   51, 153)), # pink
-    LizardClass('Eosinophil',         5, True,  (255,   51, 153)), # pink
-    LizardClass('Connective_tissue',  6, True,  (  51, 51, 255)), # cyan
+    LizardClass('Epithelial',         2, True,  ( 76, 153,   0)), # green
+    LizardClass('Lymphocyte',         3, True,  (255, 153,  51)), # orange
+    LizardClass('Plasma',             4, True,  (153,  76, 255)), # purple
+    LizardClass('Eosinophil',         5, True,  (255,  51, 153)), # pink
+    LizardClass('Connective_tissue',  6, True,  (  51, 51, 255)), # blue
 ]
-# autopep8: on
 num_classes = 7
 mapping_id = torch.tensor([x.id for x in classes])
 colors = torch.tensor([cls.color for cls in classes])
 
+LIZARD_CLASSES = ['', 'neutrophil', 'epithelial', 'lymphocyte', 'plasma', 'eosinophil', 'connective tissue']
 
 def normalize_to_neg_one_to_one(img):
     return img * 2 - 1
@@ -106,6 +104,9 @@ class LizardDataset(Dataset):
         self.root = Path(root)
         self.image_dir = os.path.join(self.root, 'images', split)
         self.label_dir = os.path.join(self.root, 'classes', split)
+        self.point_dir = os.path.join(self.root, 'points', split)
+        self.dist_dir = os.path.join(self.root, 'distances', split)
+
         self.split = split
         self.shuffle = shuffle
         self.side_x = side_x
@@ -148,10 +149,16 @@ class LizardDataset(Dataset):
                               if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
         self.labels = sorted([osp.join(self.label_dir, file) for file in os.listdir(self.label_dir)
                               if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
+        self.points = sorted([osp.join(self.point_dir, file) for file in os.listdir(self.point_dir)
+                              if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
+        self.dists = sorted([osp.join(self.dist_dir, file) for file in os.listdir(self.dist_dir)
+                              if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
 
-        assert len(self.images) == len(self.labels), f'{len(self.images)} != {len(self.labels)}'
-        for img, lbl in zip(self.images, self.labels):
+        assert len(self.images) == len(self.labels) == len(self.points) == len(self.dists), f'{len(self.images)} != {len(self.labels)} != {len(self.points)} != {len(self.dists)}'
+        for img, lbl, pnt, dist in zip(self.images, self.labels, self.points, self.dists):
             assert osp.splitext(osp.basename(img))[0] == osp.splitext(osp.basename(lbl))[0]
+            assert osp.splitext(osp.basename(img))[0] == osp.splitext(osp.basename(pnt))[0]
+            assert osp.splitext(osp.basename(img))[0] == osp.splitext(osp.basename(dist))[0]
 
     def __len__(self):
         return len(self.images)
@@ -169,11 +176,36 @@ class LizardDataset(Dataset):
             return self.random_sample()
         return self.sequential_sample(ind=ind)
 
+    def set_prompt(self, cls):
+        prompt = "high quality histopathology colon tissue image"
+        cls_now = np.unique(cls)
+        # shuffle classes and add to prompt
+        if len(cls_now)==1:
+            prompt += " with no nucleus"
+        else:
+            prompt += " including nuclei types of "
+            included = []
+            for i in cls_now[1:]:
+                included.append(LIZARD_CLASSES[int(i)])
+            random.shuffle(included)
+            if len(included) > 1:
+                included[-1] = "and " + included[-1]
+                if len(included)==2:
+                    included = ' '.join(included)
+                else:
+                    included = ', '.join(included)
+            else:
+                included = included[0]
+            prompt += included
+        return prompt
+
     def __getitem__(self, idx):
         # load image
         try:
-            original_pil_image = Image.open(self.images[idx]).convert("RGB")
+            original_pil_image  = Image.open(self.images[idx]).convert("RGB")
             original_pil_target = Image.open(self.labels[idx])
+            original_pil_point  = Image.open(self.points[idx])
+            original_pil_dist     = Image.open(self.dists[idx])
         except (OSError, ValueError) as e:
             print(f"An exception occurred trying to load file {self.images[idx]}.")
             print(f"Skipping index {idx}")
@@ -182,12 +214,17 @@ class LizardDataset(Dataset):
         # Transforms
         image = ToTensor()(original_pil_image)
         label = ToTensorNoNorm()(original_pil_target).float()
-        img_lbl = self.augmentation(torch.cat([image, label]))
+        point = ToTensorNoNorm()(original_pil_point).float()
+        dist = ToTensor()(original_pil_dist).float()
+        img_dist_lbl_pnt = self.augmentation(torch.cat([image, dist, label, point])) # 0,1,2: image, 3: dist, 4: label, 5:point
+        
+        aug_img_dist = img_dist_lbl_pnt[:4]
+        aug_lbl = img_dist_lbl_pnt[4].unsqueeze(0)
+        aug_pnt = img_dist_lbl_pnt[5].unsqueeze(0)
 
-        caption = img_lbl[3:] # caption 자리에 뭐라도 넣어야 돌아감
-
-        return img_lbl[:3], img_lbl[3:], caption
-
+        caption = self.set_prompt(label)
+        
+        return aug_img_dist, aug_lbl, caption, aug_pnt
 
 def transform_lbl(lbl: torch.Tensor, *args, **kwargs):
     lbl = lbl.long()
@@ -197,3 +234,27 @@ def transform_lbl(lbl: torch.Tensor, *args, **kwargs):
     rgbs = colors[lbl]
     rgbs = rgbs.permute(0, 3, 1, 2)
     return rgbs / 255.
+
+
+def get_text(cls):
+    prompt = "high quality histopathology colon tissue image"
+    cls_now = np.unique(cls)
+    # shuffle classes and add to prompt
+    if len(cls_now)==1:
+        prompt += " with no nucleus"
+    else:
+        prompt += " including nuclei types of "
+        included = []
+        for i in cls_now[1:]:
+            included.append(LIZARD_CLASSES[int(i)])
+        random.shuffle(included)
+        if len(included) > 1:
+            included[-1] = "and " + included[-1]
+            if len(included)==2:
+                included = ' '.join(included)
+            else:
+                included = ', '.join(included)
+        else:
+            included = included[0]
+        prompt += included
+    return prompt

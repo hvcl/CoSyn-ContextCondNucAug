@@ -610,7 +610,7 @@ class ImagenTrainer(nn.Module):
             return
 
         assert not exists(self.valid_dl), 'validation dataloader was already added'
-
+        
         dl = DataLoader(ds, batch_size=batch_size, **dl_kwargs)
         self.valid_dl = self.accelerator.prepare(dl)
 
@@ -1038,10 +1038,11 @@ class JointImagenTrainer(nn.Module):
         fp16=False,
         precision=None,
         split_batches=True,
-        dl_tuple_output_keywords_names=('images', 'labels', 'texts'),
+        dl_tuple_output_keywords_names=('images', 'labels', 'texts', 'points'),
         verbose=True,
-        split_valid_fraction=0.025,
-        split_valid_from_train=False,
+        # split_valid_fraction=0.025,
+        split_valid_fraction=0.0099, #0.0032 0099
+        split_valid_from_train=True,
         split_random_seed=42,
         checkpoint_path=None,
         checkpoint_every=None,
@@ -1087,7 +1088,6 @@ class JointImagenTrainer(nn.Module):
             'split_batches': split_batches,
             'mixed_precision': accelerator_mixed_precision,
             'kwargs_handlers': [DistributedDataParallelKwargs(find_unused_parameters=True)], **accelerate_kwargs})
-
         JointImagenTrainer.locked = self.is_distributed
 
         # cast data to fp16 at training time if needed
@@ -1153,13 +1153,11 @@ class JointImagenTrainer(nn.Module):
 
             if exists(unet_cosine_decay_max_steps):
                 scheduler = CosineAnnealingLR(optimizer, T_max=unet_cosine_decay_max_steps)
-
             if exists(unet_warmup_steps):
                 warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_period=unet_warmup_steps)
 
                 if not exists(scheduler):
                     scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
-
             # set on object
 
             setattr(self, f'optim{ind}', optimizer)  # cannot use pytorch ModuleList for some reason with optimizers
@@ -1340,13 +1338,13 @@ class JointImagenTrainer(nn.Module):
 
         assert not exists(self.valid_dl), 'validation dataloader was already added'
         self.valid_dl = self.accelerator.prepare(dl)
-
+        
     def add_train_dataset(self, ds=None, *, batch_size, **dl_kwargs):
         if not exists(ds):
             return
 
         assert not exists(self.train_dl), 'training dataloader was already added'
-
+        
         valid_ds = None
         if self.split_valid_from_train:
             train_size = int((1 - self.split_valid_fraction) * len(ds))
@@ -1359,7 +1357,7 @@ class JointImagenTrainer(nn.Module):
 
         dl = DataLoader(ds, batch_size=batch_size, **dl_kwargs)
         self.train_dl = self.accelerator.prepare(dl)
-
+        
         if not self.split_valid_from_train:
             return
 
@@ -1370,7 +1368,7 @@ class JointImagenTrainer(nn.Module):
             return
 
         assert not exists(self.valid_dl), 'validation dataloader was already added'
-
+        
         dl = DataLoader(ds, batch_size=batch_size, **dl_kwargs)
         self.valid_dl = self.accelerator.prepare(dl)
 
@@ -1410,6 +1408,8 @@ class JointImagenTrainer(nn.Module):
     def step_with_dl_iter(self, dl_iter, **kwargs):
         dl_tuple_output = cast_tuple(next(dl_iter))
         model_input = dict(list(zip(self.dl_tuple_output_keywords_names, dl_tuple_output)))
+        # kwargs {'unet_number': 1, 'max_batch_size': 8}
+        # model_input {'images': @, 'labels': @, 'texts': @, 'points': @}
         loss = self.forward(**{**kwargs, **model_input})
         return loss
 
@@ -1454,8 +1454,11 @@ class JointImagenTrainer(nn.Module):
         sorted_checkpoints = self.all_checkpoints_sorted
         checkpoints_to_discard = sorted_checkpoints[self.max_checkpoints_keep:]
 
+        '''
+        # Save all ckpt!
         for checkpoint in checkpoints_to_discard:
             self.fs.rm(checkpoint)
+        '''
 
     # saving and loading functions
 
@@ -1528,7 +1531,7 @@ class JointImagenTrainer(nn.Module):
 
     def load(self, path, only_model=False, strict=True, noop_if_not_exist=False):
         fs = self.fs
-
+        
         if noop_if_not_exist and not fs.exists(path):
             self.print(f'trainer checkpoint not found at {str(path)}')
             return
@@ -1738,15 +1741,20 @@ class JointImagenTrainer(nn.Module):
     def sample(self, *args, **kwargs):
         context = nullcontext if kwargs.pop('use_non_ema', False) else self.use_ema_unets
 
+        self.create_valid_iter()
         self.print_untrained_unets()
 
         if not self.is_main:
             kwargs['use_tqdm'] = False
 
-        with context():
-            output = self.imagen.sample(*args, device=self.device, **kwargs)
+        _, _, caption, point = next(self.valid_dl_iter)
+        caption = caption[:4]
+        point = point[:4]
 
-        return output
+        with context():
+            output = self.imagen.sample(point=point, texts=caption, *args, device=self.device, **kwargs)
+
+        return *output, caption
 
     @partial(cast_torch_tensor, cast_fp16=True)
     def forward(
@@ -1764,19 +1772,23 @@ class JointImagenTrainer(nn.Module):
             self.only_train_unet_number) or self.only_train_unet_number == unet_number, f'you can only train unet #{self.only_train_unet_number}'
 
         total_loss = 0.
+        total_loss_2 = 0.
         total_loss_seg = 0.
 
         for chunk_size_frac, (chunked_args, chunked_kwargs) in split_args_and_kwargs(*args, split_size=max_batch_size, **kwargs):
             with self.accelerator.autocast():
-                loss, loss_seg = self.imagen(*chunked_args, unet=self.unet_being_trained,
+                loss, loss_seg, loss_2 = self.imagen(*chunked_args, unet=self.unet_being_trained,
                                              unet_number=unet_number, **chunked_kwargs)
                 loss = loss * chunk_size_frac
+                loss_2 = loss_2 * chunk_size_frac
                 loss_seg = loss_seg * chunk_size_frac
 
             total_loss += loss.item()
+            total_loss_2 += loss_2.item()
             total_loss_seg += loss_seg.item()
 
             if self.training:
-                self.accelerator.backward(loss * self.lambdas[0] + loss_seg * self.lambdas[1])
+                # self.accelerator.backward(loss * self.lambdas[0] + loss_seg * self.lambdas[1] + loss_2 * self.lambdas[0])
+                self.accelerator.backward(loss * 9 + loss_seg * 3 + loss_2 * 1) # 2 / 1.5 / 1
 
-        return total_loss, total_loss_seg
+        return total_loss, total_loss_2, total_loss_seg

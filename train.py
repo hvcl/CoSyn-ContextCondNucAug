@@ -138,22 +138,9 @@ def main():
         image_sizes = ((h1, w1), )
         random_crop_sizes = (None, )
         args.unet_number = 1
-    # elif args.model_type.startswith('sr'):
-    #     addi_kwargs = dict()
-    #     if not args.condition_on_text:
-    #         addi_kwargs.update(layer_cross_attns=False)
-    #     unet1 = NullUnet()
-    #     unet2 = SRJointUnet(channels_lbl=args.channels_lbl, num_classes=args.num_classes, **addi_kwargs)
-    #     unets = (unet1, unet2)
-    #     h1, w1 = [int(i) for i in args.model_type.split('_')[1].split('x')]
-    #     h2, w2 = [int(i) for i in args.model_type.split('_')[2].split('x')]
-    #     image_sizes = ((h1, w1), (h2, w2))
-    #     random_crop_sizes = (None, args.random_crop_size)
-    #     args.unet_number = 2
     else:
         raise NotImplementedError(args.model_type)
 
-    # imagen, which contains the unets above (base unet and super resoluting ones)
 
     imagen = JointImagen(
         unets=unets,
@@ -241,21 +228,21 @@ def main():
 
     # for up- / upup- sampler they need an image and a label for upsample
     start_image_or_video = start_label_or_video = None
-    if args.unet_number > 1:
-        start_image_or_video, start_label_or_video = [], []
-        for img_path, lbl_path in zip(args.start_image_or_video, args.start_label_or_video):
-            start_image_or_video.append(T.Compose([
-                T.Resize(image_sizes[0], T.InterpolationMode.NEAREST),
-                T.ToTensor()]
-            )(Image.open(img_path)))
-            start_label_or_video.append(
-                mapping_id[T.Compose([
-                    T.Resize(image_sizes[0], T.InterpolationMode.NEAREST),
-                    ToTensorNoNorm()]
-                )(Image.open(lbl_path)).long()].float()
-            )
-        start_image_or_video = torch.stack(start_image_or_video)
-        start_label_or_video = torch.stack(start_label_or_video)
+    # if args.unet_number > 1:
+    #     start_image_or_video, start_label_or_video = [], []
+    #     for img_path, lbl_path in zip(args.start_image_or_video, args.start_label_or_video):
+    #         start_image_or_video.append(T.Compose([
+    #             T.Resize(image_sizes[0], T.InterpolationMode.NEAREST),
+    #             T.ToTensor()]
+    #         )(Image.open(img_path)))
+    #         start_label_or_video.append(
+    #             mapping_id[T.Compose([
+    #                 T.Resize(image_sizes[0], T.InterpolationMode.NEAREST),
+    #                 ToTensorNoNorm()]
+    #             )(Image.open(lbl_path)).long()].float()
+    #         )
+    #     start_image_or_video = torch.stack(start_image_or_video)
+    #     start_label_or_video = torch.stack(start_label_or_video)
 
     if trainer.is_main and args.log_wandb:
         wandb.init(
@@ -273,29 +260,31 @@ def main():
         if i % args.print_every == 0 and trainer.is_main:
             print(f'{i} / {args.num_iters}')
 
-        loss, loss_seg = trainer.train_step(unet_number=args.unet_number, max_batch_size=args.max_batch_size)
+        loss, loss_2, loss_seg = trainer.train_step(unet_number=args.unet_number, max_batch_size=args.max_batch_size)
 
-        ### Temporarily ###
-        '''
         if trainer.is_main:
-            log = {f'{args.model_type}_loss': loss, f'{args.model_type}_loss_seg': loss_seg}
+            log = {f'{args.model_type}_loss': loss, f'{args.model_type}_loss_2': loss_2, f'{args.model_type}_loss_seg': loss_seg}
             if args.log_wandb and (i % args.print_every == 0 or i == 0):
                 wandb.log(log, step=i)
             if i % args.log_every == 0 or i == 0:
-            # if (i % args.log_every == 0 or i == 0) and i>0:
-                saved_images, saved_labels = trainer.sample(
-                    texts=args.test_caption if args.condition_on_text else None,
+                saved_images, saved_labels, saved_points, saved_texts = trainer.sample(
+                    # texts=args.test_caption if args.condition_on_text else None,
                     cond_scale=3., batch_size=args.test_batch_size,
                     start_at_unet_number=args.unet_number, stop_at_unet_number=args.unet_number,
                     start_image_or_video=start_image_or_video, start_label_or_video=start_label_or_video,
                     lowres_sample_noise_level=0.0,)
                 saved_labels = transform_lbl(saved_labels, 'train_id')
-                saved_images_labels = torchvision.utils.make_grid(
-                    torch.cat([saved_images, saved_labels]), nrow=max(2, args.test_batch_size), pad_value=1.)
+                saved_points = transform_lbl(saved_points, 'train_id')
+
+                saved_distances = saved_images[:,3].unsqueeze(1)
+                saved_distances = torch.cat([saved_distances, saved_distances, saved_distances], dim=1)
+                saved_images = saved_images[:,:3]
+
+                sampled = torchvision.utils.make_grid(
+                    torch.cat([saved_images, saved_distances, saved_labels, saved_points]), nrow=max(4, args.test_batch_size), pad_value=1.)
                 if args.log_wandb:
-                    wandb.log({**log, f'{args.model_type}_samples': wandb.Image(saved_images_labels,
-                              caption=args.test_caption if args.condition_on_text else None)}, step=i)
-        '''
+                    wandb.log({**log, f'{args.model_type}_samples': wandb.Image(sampled,
+                              caption=saved_texts if args.condition_on_text else None)}, step=i)
 
     if trainer.is_main and args.log_wandb:
         wandb.finish()

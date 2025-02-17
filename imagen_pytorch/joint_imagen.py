@@ -6,8 +6,9 @@ from random import random
 from typing import List, Union
 
 import os
-import numpy as np
+import tifffile
 import kornia.augmentation as K
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -35,6 +36,8 @@ from imagen_pytorch.imagen_pytorch import (
     beta_linear_log_snr, alpha_cosine_log_snr, log, log_snr_to_alpha_sigma)
 from imagen_pytorch.imagen_video.imagen_video import Unet3D, resize_video_to
 from imagen_pytorch.t5 import DEFAULT_T5_NAME, get_encoded_dim, t5_encode_text
+from imagen_pytorch.rrdb import RRDBNet
+from imagen_pytorch.plip import FrozenCLIPEmbedder
 
 
 def log_1_min_a(a):
@@ -290,7 +293,8 @@ class JointUnet(nn.Module):
         dim,
         num_classes,
         image_embed_dim=1024,
-        text_embed_dim=get_encoded_dim(DEFAULT_T5_NAME),
+        # text_embed_dim=get_encoded_dim(DEFAULT_T5_NAME),
+        text_embed_dim=512,
         num_resnet_blocks=1,
         cond_dim=None,
         num_image_tokens=4,
@@ -316,7 +320,8 @@ class JointUnet(nn.Module):
         use_linear_attn=False,
         use_linear_cross_attn=False,
         cond_on_text=True,
-        max_text_len=256,
+        # max_text_len=256,
+        max_text_len=154,
         init_dim=None,
         resnet_groups=8,
         init_conv_kernel_size=7,          # kernel size of initial conv, if not using cross embed
@@ -336,7 +341,8 @@ class JointUnet(nn.Module):
         cosine_sim_attn=False,
         self_cond=False,
         combine_upsample_fmaps=False,      # combine feature maps from all upsample blocks, used in unet squared successfully
-        pixel_shuffle_upsample=True        # may address checkboard artifacts
+        pixel_shuffle_upsample=True,        # may address checkboard artifacts
+        point_map=True
     ):
         super().__init__()
 
@@ -361,11 +367,11 @@ class JointUnet(nn.Module):
         # label embedding
 
         self.num_classes = num_classes
+        self.init_emb_pnt = LabelEmbedding(self.num_classes, channels_lbl)
         self.init_emb_seg = LabelEmbedding(self.num_classes, channels_lbl)
         self.init_emb_seg_lowres = LabelEmbedding(self.num_classes, channels_lbl) if lowres_cond else None
 
-        # (1) in cascading diffusion, one concats the low resolution image, blurred, 
-        #     for conditioning the higher resolution synthesis
+        # (1) in cascading diffusion, one concats the low resolution image, blurred, for conditioning the higher resolution synthesis
         # (2) in self conditioning, one appends the predict x0 (x_start)
         # (3) in joint diffusion, label condition appends on image.
         init_channels = (channels + channels_lbl) * (1 + int(lowres_cond) + int(self_cond))  # Joint Imagen
@@ -384,7 +390,9 @@ class JointUnet(nn.Module):
 
         # initial convolution
 
-        self.init_conv = CrossEmbedLayer(init_channels, dim_out=init_dim, kernel_sizes=init_cross_embed_kernel_sizes, stride=1) if init_cross_embed else nn.Conv2d(
+        # self.init_conv = CrossEmbedLayer(init_channels, dim_out=init_dim, kernel_sizes=init_cross_embed_kernel_sizes, stride=1) if init_cross_embed else nn.Conv2d(
+        # 64 7
+        self.init_conv = CrossEmbedLayer(64, dim_out=init_dim, kernel_sizes=init_cross_embed_kernel_sizes, stride=1) if init_cross_embed else nn.Conv2d(
             init_channels, init_dim, init_conv_kernel_size, padding=init_conv_kernel_size // 2)
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
@@ -445,9 +453,9 @@ class JointUnet(nn.Module):
 
         self.text_to_cond = None
 
-        # if cond_on_text:
-        #     assert exists(text_embed_dim), 'text_embed_dim must be given to the unet if cond_on_text is True'
-        #     self.text_to_cond = nn.Linear(text_embed_dim, cond_dim)
+        if cond_on_text:
+            assert exists(text_embed_dim), 'text_embed_dim must be given to the unet if cond_on_text is True'
+            self.text_to_cond = nn.Linear(text_embed_dim, cond_dim)
 
         # finer control over whether to condition on text encodings
 
@@ -503,8 +511,8 @@ class JointUnet(nn.Module):
 
         downsample_klass = Downsample
 
-        # if cross_embed_downsample:
-        #     downsample_klass = partial(CrossEmbedLayer, kernel_sizes=cross_embed_downsample_kernel_sizes)
+        if cross_embed_downsample:
+            downsample_klass = partial(CrossEmbedLayer, kernel_sizes=cross_embed_downsample_kernel_sizes)
 
         # initial resnet block (for memory efficient unet)
 
@@ -556,9 +564,9 @@ class JointUnet(nn.Module):
             # whether to do post-downsample, for non-memory efficient unet
 
             post_downsample = None
-            # if not memory_efficient:
-            #     post_downsample = downsample_klass(current_dim, dim_out) if not is_last else Parallel(
-            #         nn.Conv2d(dim_in, dim_out, 3, padding=1), nn.Conv2d(dim_in, dim_out, 1))
+            if not memory_efficient:
+                post_downsample = downsample_klass(current_dim, dim_out) if not is_last else Parallel(
+                    nn.Conv2d(dim_in, dim_out, 3, padding=1), nn.Conv2d(dim_in, dim_out, 1))
 
             self.downs.append(nn.ModuleList([
                 pre_downsample,
@@ -626,25 +634,37 @@ class JointUnet(nn.Module):
         )
 
         # whether to do a final residual from initial conv to the final resnet block out
-    
-        # self.init_conv_to_final_conv_residual = init_conv_to_final_conv_residual
+
+        self.init_conv_to_final_conv_residual = init_conv_to_final_conv_residual
         final_conv_dim = self.upsample_combiner.dim_out + (dim if init_conv_to_final_conv_residual else 0)
+        # for SegDiff point map residual
+        final_conv_dim = self.upsample_combiner.dim_out + (dim if point_map else 0)
 
         # final optional resnet block and convolution out
-        
+
         self.final_res_block = ResnetBlock(final_conv_dim, dim, time_cond_dim=time_cond_dim,
                                            groups=resnet_groups[0], use_gca=True) if final_resnet_block else None
 
         final_conv_dim_in = dim if final_resnet_block else final_conv_dim
         final_conv_dim_in += (channels + channels_lbl) if lowres_cond else 0
 
-        self.final_conv = nn.Conv2d(final_conv_dim_in, self.channels_out,
+        self.final_conv = nn.Conv2d(final_conv_dim_in, 3,
+                                    final_conv_kernel_size, padding=final_conv_kernel_size // 2)
+        
+        self.final_conv_2 = nn.Conv2d(final_conv_dim_in, 1,
                                     final_conv_kernel_size, padding=final_conv_kernel_size // 2)
         self.final_conv_seg = nn.Conv2d(final_conv_dim_in, self.num_classes,
                                         final_conv_kernel_size, padding=final_conv_kernel_size // 2)
 
         zero_init_(self.final_conv)
+        zero_init_(self.final_conv_2)
         zero_init_(self.final_conv_seg)
+        
+        self.rrdb = RRDBNet()#(nb=rrdb_blocks, out_nc=model_channels)
+        
+        self.img_conv = nn.Sequential(nn.Conv2d(3,16,1), nn.Conv2d(16,64,1))
+        self.dist_conv = nn.Sequential(nn.Conv2d(1,16,1), nn.Conv2d(16,64,1))
+        self.lbl_conv = nn.Sequential(nn.Conv2d(3,16,1), nn.Conv2d(16,64,1))
 
     # if the current settings for the unet are not correct
     # for cascading DDPM, then reinit the unet with the right settings
@@ -716,28 +736,56 @@ class JointUnet(nn.Module):
         self,
         *args,
         cond_scale=1.,
+        point=None,
         **kwargs
     ):
-        logits, logits_seg = self.forward(*args, **kwargs)
-
         if cond_scale == 1:
-            return logits, logits_seg
+            logits, logits2, logits_seg = self.forward(*args, point_map=point, **kwargs)
+            
+            return logits, logits2, logits_seg
+        
+        elif cond_scale == 0:
+            null_logits, null_logits2, null_logits_seg = self.forward(*args, point_map=point, cond_drop_prob=1., **kwargs)
+            
+            return null_logits, null_logits2, null_logits_seg
+        
+        else:
+            logits, logits2, logits_seg = self.forward(*args, point_map=point, **kwargs)
+            
+            null_logits, null_logits2, null_logits_seg = self.forward(*args, point_map=point, cond_drop_prob=1., **kwargs)
 
-        null_logits, null_logits_seg = self.forward(*args, cond_drop_prob=1., **kwargs)
+            cond_logits = null_logits + (logits - null_logits) * cond_scale
+            
+            cond_logits2 = null_logits2 + (logits2 - null_logits2) * cond_scale
 
-        cond_logits = null_logits + (logits - null_logits) * cond_scale
+            cond_logits_seg = null_logits_seg + (logits_seg - null_logits_seg) * cond_scale
 
-        # TODO: CFG of categorical is not clear.
-        cond_logits_seg = null_logits_seg + (logits_seg - null_logits_seg) * cond_scale
+            return cond_logits, cond_logits2, cond_logits_seg
+                
+        # logits, logits2, logits_seg = self.forward(*args, point_map=point, **kwargs)
 
-        return cond_logits, cond_logits_seg
+        # if cond_scale == 1:
+        #     return logits, logits2, logits_seg
+
+        # null_logits, null_logits2, null_logits_seg = self.forward(*args, point_map=point, cond_drop_prob=1., **kwargs)
+
+        # cond_logits = null_logits + (logits - null_logits) * cond_scale
+        
+        # cond_logits2 = null_logits2 + (logits2 - null_logits2) * cond_scale
+
+        # # TODO: CFG of categorical is not clear.
+        # cond_logits_seg = null_logits_seg + (logits_seg - null_logits_seg) * cond_scale
+
+        # return cond_logits, cond_logits2, cond_logits_seg
 
     def forward(
         self,
         x,
+        dist,
         lbl,
         time,
         *,
+        point_map = None,
         lowres_cond_img=None,
         lowres_cond_lbl=None,
         lowres_noise_times=None,
@@ -748,12 +796,17 @@ class JointUnet(nn.Module):
         self_cond_lbl=None,
         cond_drop_prob=0.
     ):
-        # batch_size, device = x.shape[0], x.device
+        batch_size, device = x.shape[0], x.device
 
         # joint imagen
 
         lbl = self.init_emb_seg(lbl.long())
-        x = torch.cat((x, lbl), dim=1)
+        # x = torch.cat((x, dist, lbl), dim=1) # 3+1+3=7
+        x = self.img_conv(x)
+        dist = self.dist_conv(dist)
+        lbl = self.lbl_conv(lbl)
+        x = x + dist + lbl
+        
 
         # condition on self
 
@@ -767,24 +820,24 @@ class JointUnet(nn.Module):
 
         # add low resolution conditioning, if present
 
-        assert not (self.lowres_cond and not exists(lowres_cond_img)
-                    ), 'low resolution conditioning image must be present'
-        assert not (self.lowres_cond and not exists(lowres_noise_times)
-                    ), 'low resolution conditioning noise time must be present'
+        # assert not (self.lowres_cond and not exists(lowres_cond_img)
+        #             ), 'low resolution conditioning image must be present'
+        # assert not (self.lowres_cond and not exists(lowres_noise_times)
+        #             ), 'low resolution conditioning noise time must be present'
 
-        if exists(lowres_cond_img) and exists(lowres_cond_lbl):
-            lowres_cond_lbl = self.init_emb_seg_lowres(lowres_cond_lbl.long())
-            x = torch.cat((x, lowres_cond_img, lowres_cond_lbl), dim=1)
+        # if exists(lowres_cond_img) and exists(lowres_cond_lbl):
+        #     lowres_cond_lbl = self.init_emb_seg_lowres(lowres_cond_lbl.long())
+        #     x = torch.cat((x, lowres_cond_img, lowres_cond_lbl), dim=1)
 
         # condition on input image
 
-        assert not (self.has_cond_image ^ exists(cond_images)), \
-            'you either requested to condition on an image on the unet, but the conditioning image is not supplied, or vice versa'
+        # assert not (self.has_cond_image ^ exists(cond_images)), \
+        #     'you either requested to condition on an image on the unet, but the conditioning image is not supplied, or vice versa'
 
-        if exists(cond_images):
-            assert cond_images.shape[1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
-            cond_images = resize_image_to(cond_images, x.shape[-1])
-            x = torch.cat((cond_images, x), dim=1)
+        # if exists(cond_images):
+        #     assert cond_images.shape[1] == self.cond_images_channels, 'the number of channels on the conditioning image you are passing in does not match what you specified on initialiation of the unet'
+        #     cond_images = resize_image_to(cond_images, x.shape[-1])
+        #     x = torch.cat((cond_images, x), dim=1)
 
         # initial convolution
 
@@ -792,8 +845,8 @@ class JointUnet(nn.Module):
 
         # init conv residual
 
-        # if self.init_conv_to_final_conv_residual:
-        #     init_conv_residual = x.clone()
+        if self.init_conv_to_final_conv_residual:
+            init_conv_residual = x.clone()
 
         # time conditioning
 
@@ -807,80 +860,80 @@ class JointUnet(nn.Module):
         # add lowres time conditioning to time hiddens
         # and add lowres time tokens along sequence dimension for attention
 
-        if self.lowres_cond:
-            lowres_time_hiddens = self.to_lowres_time_hiddens(lowres_noise_times)
-            lowres_time_tokens = self.to_lowres_time_tokens(lowres_time_hiddens)
-            lowres_t = self.to_lowres_time_cond(lowres_time_hiddens)
+        # if self.lowres_cond:
+        #     lowres_time_hiddens = self.to_lowres_time_hiddens(lowres_noise_times)
+        #     lowres_time_tokens = self.to_lowres_time_tokens(lowres_time_hiddens)
+        #     lowres_t = self.to_lowres_time_cond(lowres_time_hiddens)
 
-            t = t + lowres_t
-            time_tokens = torch.cat((time_tokens, lowres_time_tokens), dim=-2)
+        #     t = t + lowres_t
+        #     time_tokens = torch.cat((time_tokens, lowres_time_tokens), dim=-2)
 
         # text conditioning
 
-        # text_tokens = None
+        text_tokens = None
 
-        # if exists(text_embeds) and self.cond_on_text:
+        if exists(text_embeds) and self.cond_on_text:
 
-        #     # conditional dropout
+            # conditional dropout
 
-        #     text_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
+            text_keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
 
-        #     text_keep_mask_embed = rearrange(text_keep_mask, 'b -> b 1 1')
-        #     text_keep_mask_hidden = rearrange(text_keep_mask, 'b -> b 1')
+            text_keep_mask_embed = rearrange(text_keep_mask, 'b -> b 1 1')
+            text_keep_mask_hidden = rearrange(text_keep_mask, 'b -> b 1')
 
-        #     # calculate text embeds
+            # calculate text embeds
 
-        #     text_tokens = self.text_to_cond(text_embeds)
+            text_tokens = self.text_to_cond(text_embeds)
 
-        #     text_tokens = text_tokens[:, :self.max_text_len]
+            text_tokens = text_tokens[:, :self.max_text_len]
 
-        #     if exists(text_mask):
-        #         text_mask = text_mask[:, :self.max_text_len]
+            if exists(text_mask):
+                text_mask = text_mask[:, :self.max_text_len]
 
-        #     text_tokens_len = text_tokens.shape[1]
-        #     remainder = self.max_text_len - text_tokens_len
+            text_tokens_len = text_tokens.shape[1]
+            remainder = self.max_text_len - text_tokens_len
 
-        #     if remainder > 0:
-        #         text_tokens = F.pad(text_tokens, (0, 0, 0, remainder))
+            if remainder > 0:
+                text_tokens = F.pad(text_tokens, (0, 0, 0, remainder))
 
-        #     if exists(text_mask):
-        #         if remainder > 0:
-        #             text_mask = F.pad(text_mask, (0, remainder), value=False)
+            if exists(text_mask):
+                if remainder > 0:
+                    text_mask = F.pad(text_mask, (0, remainder), value=False)
 
-        #         text_mask = rearrange(text_mask, 'b n -> b n 1')
-        #         text_keep_mask_embed = text_mask & text_keep_mask_embed
+                text_mask = rearrange(text_mask, 'b n -> b n 1')
+                text_keep_mask_embed = text_mask & text_keep_mask_embed
 
-        #     null_text_embed = self.null_text_embed.to(text_tokens.dtype)  # for some reason pytorch AMP not working
+            null_text_embed = self.null_text_embed.to(text_tokens.dtype)  # for some reason pytorch AMP not working
 
-        #     text_tokens = torch.where(
-        #         text_keep_mask_embed,
-        #         text_tokens,
-        #         null_text_embed
-        #     )
+            text_tokens = torch.where(
+                text_keep_mask_embed,
+                text_tokens,
+                null_text_embed
+            )
 
-        #     if exists(self.attn_pool):
-        #         text_tokens = self.attn_pool(text_tokens)
+            if exists(self.attn_pool):
+                text_tokens = self.attn_pool(text_tokens)
 
-        #     # extra non-attention conditioning by projecting and then summing text embeddings to time
-        #     # termed as text hiddens
+            # extra non-attention conditioning by projecting and then summing text embeddings to time
+            # termed as text hiddens
 
-        #     mean_pooled_text_tokens = text_tokens.mean(dim=-2)
+            mean_pooled_text_tokens = text_tokens.mean(dim=-2)
 
-        #     text_hiddens = self.to_text_non_attn_cond(mean_pooled_text_tokens)
+            text_hiddens = self.to_text_non_attn_cond(mean_pooled_text_tokens)
 
-        #     null_text_hidden = self.null_text_hidden.to(t.dtype)
+            null_text_hidden = self.null_text_hidden.to(t.dtype)
 
-        #     text_hiddens = torch.where(
-        #         text_keep_mask_hidden,
-        #         text_hiddens,
-        #         null_text_hidden
-        #     )
+            text_hiddens = torch.where(
+                text_keep_mask_hidden,
+                text_hiddens,
+                null_text_hidden
+            )
 
-        #     t = t + text_hiddens
+            t = t + text_hiddens
 
         # main conditioning tokens (c)
 
-        c = time_tokens # if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim=-2)
+        c = time_tokens if not exists(text_tokens) else torch.cat((time_tokens, text_tokens), dim=-2)
 
         # normalize conditioning tokens
 
@@ -888,11 +941,30 @@ class JointUnet(nn.Module):
 
         # initial resnet block (for memory efficient unet)
 
+        # 이거함
         if exists(self.init_resnet_block):
             x = self.init_resnet_block(x, t)
 
-        # go through the layers of the unet, down and up
+        # prob_mask
 
+        # SegDiff point map encoding        
+        if exists(point_map):
+            emb_point = self.init_emb_pnt(point_map)
+            point_map_feature = self.rrdb(emb_point)
+
+            # ## dropout
+            # B,C,H,W = point_map_feature.shape
+            # point_feature_mask = torch.zeros([B,1,H,W], device = device).float().uniform_(0, 1) > cond_drop_prob
+            # point_map_feature = point_map_feature * point_feature_mask
+
+            # point_map_feature = dropout(point_map_feature)
+
+            # print(emb_point.shape, point_map_feature.shape, x.shape)
+            x = x + point_map_feature
+            point_map_residual = x.clone()
+        
+        # go through the layers of the unet, down and up
+        
         hiddens = []
 
         for pre_downsample, init_block, resnet_blocks, attn_block, post_downsample in self.downs:
@@ -908,8 +980,8 @@ class JointUnet(nn.Module):
             x = attn_block(x, c)
             hiddens.append(x)
 
-            # if exists(post_downsample):
-            #     x = post_downsample(x)
+            if exists(post_downsample):
+                x = post_downsample(x)
 
         x = self.mid_block1(x, t, c)
 
@@ -918,8 +990,7 @@ class JointUnet(nn.Module):
 
         x = self.mid_block2(x, t, c)
 
-        def add_skip_connection(x):
-            return torch.cat((x, hiddens.pop() * self.skip_connect_scale), dim=1)
+        def add_skip_connection(x): return torch.cat((x, hiddens.pop() * self.skip_connect_scale), dim=1)
 
         up_hiddens = []
 
@@ -942,16 +1013,22 @@ class JointUnet(nn.Module):
 
         # final top-most residual if needed
 
-        # if self.init_conv_to_final_conv_residual:
-        #     x = torch.cat((x, init_conv_residual), dim=1)
+        # 안 함
+        if self.init_conv_to_final_conv_residual:
+            x = torch.cat((x, init_conv_residual), dim=1)
 
+        # 위에 대신 SegDiff point map skip connection
+        if exists(point_map):
+            x = torch.cat((x, point_map_residual), dim=1)
+        
+        # 함
         if exists(self.final_res_block):
             x = self.final_res_block(x, t)
-        
-        if exists(lowres_cond_img) and exists(lowres_cond_lbl):
-            x = torch.cat((x, lowres_cond_img, lowres_cond_lbl), dim=1)
 
-        return self.final_conv(x), self.final_conv_seg(x)
+        # if exists(lowres_cond_img) and exists(lowres_cond_lbl):
+        #     x = torch.cat((x, lowres_cond_img, lowres_cond_lbl), dim=1)
+
+        return self.final_conv(x), self.final_conv_2(x), self.final_conv_seg(x)
 
 # predefined unets, with configs lining up with hyperparameters in appendix of paper
 
@@ -996,13 +1073,15 @@ class JointImagen(nn.Module):
         image_sizes,                                # for cascading ddpm, image size at each stage
         num_classes,
         text_encoder_name=DEFAULT_T5_NAME,
-        text_embed_dim=None,
+        # text_embed_dim=None,
+        text_embed_dim=512,
         channels=3,
         timesteps=1000,
         sample_timesteps=100,
         cond_drop_prob=0.1,
         loss_type='l2',
         noise_schedules='cosine',
+        noise_schedules_2='cosine',
         noise_schedules_lbl='cosine_p',
         cosine_p_lbl=1.0,
         pred_objectives='noise',
@@ -1068,6 +1147,9 @@ class JointImagen(nn.Module):
         noise_schedules = cast_tuple(noise_schedules)
         noise_schedules = pad_tuple_to_length(noise_schedules, 2, 'cosine')
         noise_schedules = pad_tuple_to_length(noise_schedules, num_unets, 'linear')
+        noise_schedules_2 = cast_tuple(noise_schedules_2)
+        noise_schedules_2 = pad_tuple_to_length(noise_schedules_2, 2, 'cosine')
+        noise_schedules_2 = pad_tuple_to_length(noise_schedules_2, num_unets, 'linear')
         noise_schedules_lbl = cast_tuple(noise_schedules_lbl)
         noise_schedules_lbl = pad_tuple_to_length(noise_schedules_lbl, 2, 'cosine_p')
         noise_schedules_lbl = pad_tuple_to_length(noise_schedules_lbl, num_unets, 'linear')
@@ -1075,23 +1157,30 @@ class JointImagen(nn.Module):
         # construct noise schedulers
 
         noise_scheduler_klass = GaussianDiffusionContinuousTimes
+        noise_scheduler_2_klass = GaussianDiffusionContinuousTimes
         noise_scheduler_lbl_klass = MultinomialDiffusion
         self.noise_schedulers = nn.ModuleList([])
+        self.noise_schedulers_2 = nn.ModuleList([])
         self.noise_schedulers_lbl = nn.ModuleList([])
 
-        for timestep, noise_schedule, noise_schedule_lbl in zip(timesteps, noise_schedules, noise_schedules_lbl):
+        for timestep, noise_schedule, noise_schedule_2, noise_schedule_lbl in zip(timesteps, noise_schedules, noise_schedules_2, noise_schedules_lbl):
             noise_scheduler = noise_scheduler_klass(noise_schedule=noise_schedule, timesteps=timestep)
             self.noise_schedulers.append(noise_scheduler)
+            noise_scheduler_2 = noise_scheduler_2_klass(noise_schedule=noise_schedule_2, timesteps=timestep)
+            self.noise_schedulers_2.append(noise_scheduler_2)
             noise_scheduler_lbl = noise_scheduler_lbl_klass(
                 num_classes, noise_schedule=noise_schedule_lbl, timesteps=timestep, p=cosine_p_lbl)
             self.noise_schedulers_lbl.append(noise_scheduler_lbl)
 
         self.noise_schedulers_sample = nn.ModuleList([])
+        self.noise_schedulers_2_sample = nn.ModuleList([])
         self.noise_schedulers_lbl_sample = nn.ModuleList([])
 
-        for sample_timestep, noise_schedule, noise_schedule_lbl in zip(sample_timesteps, noise_schedules, noise_schedules_lbl):
+        for sample_timestep, noise_schedule, noise_schedule_2, noise_schedule_lbl in zip(sample_timesteps, noise_schedules, noise_schedules_2, noise_schedules_lbl):
             noise_scheduler_sample = noise_scheduler_klass(noise_schedule=noise_schedule, timesteps=sample_timestep)
             self.noise_schedulers_sample.append(noise_scheduler_sample)
+            noise_scheduler_2_sample = noise_scheduler_2_klass(noise_schedule=noise_schedule_2, timesteps=sample_timestep)
+            self.noise_schedulers_2_sample.append(noise_scheduler_2_sample)
             noise_scheduler_lbl_sample = noise_scheduler_lbl_klass(
                 num_classes, noise_schedule=noise_schedule_lbl, timesteps=sample_timestep, p=cosine_p_lbl)
             self.noise_schedulers_lbl_sample.append(noise_scheduler_lbl_sample)
@@ -1117,9 +1206,11 @@ class JointImagen(nn.Module):
         # get text encoder
 
         self.text_encoder_name = text_encoder_name
-        self.text_embed_dim = default(text_embed_dim, lambda: get_encoded_dim(text_encoder_name))
+        # self.text_embed_dim = default(text_embed_dim, lambda: get_encoded_dim(text_encoder_name))
+        self.text_embed_dim = text_embed_dim
 
-        self.encode_text = partial(t5_encode_text, name=text_encoder_name)
+        # self.encode_text = partial(t5_encode_text, name=text_encoder_name)
+        self.encode_text = FrozenCLIPEmbedder()
 
         # construct unets
 
@@ -1270,11 +1361,14 @@ class JointImagen(nn.Module):
         self,
         unet: JointUnet,
         x,
+        dist,
         log_lbl,
         t,
         *,
         noise_scheduler: GaussianDiffusionContinuousTimes,
+        noise_scheduler_2: GaussianDiffusionContinuousTimes,
         noise_scheduler_lbl: MultinomialDiffusion,
+        point=None,
         text_embeds=None,
         text_mask=None,
         cond_images=None,
@@ -1291,9 +1385,9 @@ class JointImagen(nn.Module):
     ):
         assert not (cond_scale != 1. and not self.can_classifier_guidance), 'imagen was not trained with conditional dropout, and thus one cannot use classifier free guidance (cond_scale anything other than 1)'
         lbl = log_onehot_to_index(log_lbl)
-        pred, pred_lbl = default(model_output, lambda: unet.forward_with_cond_scale(
-            x, lbl, noise_scheduler.get_condition(t),
-            text_embeds=text_embeds, text_mask=text_mask,
+        pred, pred_dist, pred_lbl = default(model_output, lambda: unet.forward_with_cond_scale(
+            x, dist, lbl, noise_scheduler.get_condition(t),
+            text_embeds=text_embeds, text_mask=text_mask, point=point,
             cond_images=cond_images, cond_scale=cond_scale,
             lowres_cond_img=lowres_cond_img, lowres_cond_lbl=lowres_cond_lbl,
             self_cond=self_cond, self_cond_lbl=self_cond_lbl,
@@ -1303,9 +1397,11 @@ class JointImagen(nn.Module):
 
         if pred_objective == 'noise':
             x_start = noise_scheduler.predict_start_from_noise(x, t=t, noise=pred)
+            dist_start = noise_scheduler_2.predict_start_from_noise(dist, t=t, noise=pred_dist)
             # lbl_start = noise_scheduler_lbl.predict_start_from_noise(log_lbl, t=t, noise=pred_lbl) # TODO ???
         elif pred_objective == 'x_start':
             x_start = pred
+            dist_start = pred_dist
             # lbl_start = pred_lbl
         else:
             raise ValueError(f'unknown objective {pred_objective}')
@@ -1323,23 +1419,38 @@ class JointImagen(nn.Module):
             s.clamp_(min=1.)
             s = right_pad_dims_to(x_start, s)
             x_start = x_start.clamp(-s, s) / s
+            
+            s = torch.quantile(
+                rearrange(dist_start, 'b ... -> b (...)').abs(),
+                self.dynamic_thresholding_percentile,
+                dim=-1
+            )
+
+            s.clamp_(min=1.)
+            s = right_pad_dims_to(dist_start, s)
+            dist_start = dist_start.clamp(-s, s) / s
         else:
             x_start.clamp_(-1., 1.)
+            dist_start.clamp_(-1., 1.)
 
         mean_and_variance = noise_scheduler.q_posterior(x_start=x_start, x_t=x, t=t, t_next=t_next)
+        mean_and_variance_2 = noise_scheduler_2.q_posterior(x_start=dist_start, x_t=dist, t=t, t_next=t_next)
         log_lbl = noise_scheduler_lbl.log_sample_categorical(pred_lbl)
-        return mean_and_variance, log_lbl, x_start, lbl_start
+        return mean_and_variance, log_lbl, x_start, lbl_start, mean_and_variance_2, dist_start
 
     @torch.no_grad()
     def p_sample(
         self,
         unet,
         x,
+        dist,
         log_lbl,
         t,
         *,
         noise_scheduler,
+        noise_scheduler_2,
         noise_scheduler_lbl,
+        point=None,
         t_next=None,
         text_embeds=None,
         text_mask=None,
@@ -1354,9 +1465,9 @@ class JointImagen(nn.Module):
         dynamic_threshold=True,
     ):
         b, *_, device = *x.shape, x.device
-        (model_mean, _, model_log_variance), pred_lbl, x_start, lbl_start = self.p_mean_variance(
-            unet, x=x, log_lbl=log_lbl, t=t, t_next=t_next,
-            noise_scheduler=noise_scheduler, noise_scheduler_lbl=noise_scheduler_lbl,
+        (model_mean, _, model_log_variance), pred_lbl, x_start, lbl_start, (model_mean_2, _, model_log_variance_2), dist_start = self.p_mean_variance(
+            unet, x=x, dist=dist, log_lbl=log_lbl, t=t, t_next=t_next, point=point,
+            noise_scheduler=noise_scheduler, noise_scheduler_lbl=noise_scheduler_lbl, noise_scheduler_2 = noise_scheduler_2,
             text_embeds=text_embeds, text_mask=text_mask,
             cond_images=cond_images, cond_scale=cond_scale,
             lowres_cond_img=lowres_cond_img, lowres_cond_lbl=lowres_cond_lbl,
@@ -1364,12 +1475,19 @@ class JointImagen(nn.Module):
             lowres_noise_times=lowres_noise_times,
             pred_objective=pred_objective, dynamic_threshold=dynamic_threshold)
         noise = torch.randn_like(x)
+        noise2 = torch.randn_like(dist)
         # no noise when t == 0
         is_last_sampling_timestep = (t_next == 0) if isinstance(
             noise_scheduler, GaussianDiffusionContinuousTimes) else (t == 0)
         nonzero_mask = (1 - is_last_sampling_timestep.float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         pred = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
-        return pred, pred_lbl, x_start, lbl_start
+        
+        is_last_sampling_timestep2 = (t_next == 0) if isinstance(
+            noise_scheduler_2, GaussianDiffusionContinuousTimes) else (t == 0)
+        nonzero_mask = (1 - is_last_sampling_timestep2.float()).reshape(b, *((1,) * (len(dist.shape) - 1)))
+        pred_dist = model_mean_2 + nonzero_mask * (0.5 * model_log_variance_2).exp() * noise2
+        
+        return pred, pred_dist, pred_lbl, x_start, dist_start, lbl_start
 
     @torch.no_grad()
     def p_sample_loop(
@@ -1378,7 +1496,9 @@ class JointImagen(nn.Module):
         shape,
         *,
         noise_scheduler: GaussianDiffusionContinuousTimes,
+        noise_scheduler_2: GaussianDiffusionContinuousTimes,
         noise_scheduler_lbl: MultinomialDiffusion,
+        point=None,
         lowres_cond_img=None,
         lowres_cond_lbl=None,
         lowres_noise_times=None,
@@ -1402,6 +1522,7 @@ class JointImagen(nn.Module):
 
         batch, _, h, w = shape
         img = torch.randn(shape, device=device)
+        dist = torch.randn((1,1,256,256), device=device)
         uniform_logits = torch.zeros((batch, self.num_classes) + (h, w), device=device)
         log_lbl = noise_scheduler_lbl.log_sample_categorical(uniform_logits)
 
@@ -1458,12 +1579,14 @@ class JointImagen(nn.Module):
                 self_cond = x_start if unet.self_cond else None
                 self_cond_lbl = lbl_start if unet.self_cond else None
 
-                img, log_lbl, x_start, lbl_start = self.p_sample(
-                    unet,
-                    img,
-                    log_lbl,
-                    times,
+                img, dist, log_lbl, x_start, dist_start, lbl_start = self.p_sample(
+                    unet=unet,
+                    x=img,
+                    dist=dist,
+                    log_lbl=log_lbl,
+                    t=times,
                     t_next=times_next,
+                    point=point,
                     text_embeds=text_embeds,
                     text_mask=text_mask,
                     cond_images=cond_images,
@@ -1474,6 +1597,7 @@ class JointImagen(nn.Module):
                     lowres_cond_lbl=lowres_cond_lbl,
                     lowres_noise_times=lowres_noise_times,
                     noise_scheduler=noise_scheduler,
+                    noise_scheduler_2=noise_scheduler_2,
                     noise_scheduler_lbl=noise_scheduler_lbl,
                     pred_objective=pred_objective,
                     dynamic_threshold=dynamic_threshold,
@@ -1492,26 +1616,43 @@ class JointImagen(nn.Module):
                         log_lbl,
                         renoised_log_lbl
                     )
-
+                
                 # print(times)
                 # # if int(times*1000) % 10==0:
                 # if True:
                 #     unnorm_img = self.unnormalize_img(torch.clone(img).cpu().clamp_(-1., 1.))
-                #     _img = (unnorm_img[:,:3].squeeze(0).permute(1,2,0).numpy() * 255).astype(np.uint8)
+                #     _img = (unnorm_img[:,:3].squeeze(0).permute(1,2,0).numpy() * 255).astype(np.uint8) # [256,256,3]
+                #     _hor = unnorm_img[:,3].numpy()
+                #     _ver = unnorm_img[:,4].numpy()
 
                 #     _lbl = log_onehot_to_index(log_lbl)
                 #     _lbl = transform_lbl_lizard(_lbl.cpu()) * 255
+                
                 #     _lbl = _lbl.squeeze(0).permute(1,2,0).numpy().astype(np.uint8)
+                #     print(np.unique(_lbl))
                     
                 #     cur_step = int(times*1000)
-                #     fn = f"uncond_{cur_step:04d}.png"
-                #     pth_img = "outputs/lizard/paper_figure_teaser5/samples"
-                #     pth_lbl = "outputs/lizard/paper_figure_teaser5/labels"
+                #     fn = f"crag_47__512_384_{cur_step:04d}.png"
+                #     fn_tif = f"crag_47__512_384_{cur_step:04d}.tif"
+                #     pth_img = "outputs/lizard/paper_figure_teaser/samples"
+                #     pth_lbl = "outputs/lizard/paper_figure_teaser/labels"
+                #     pth_hor = "outputs/lizard/paper_figure_teaser/hor"
+                #     pth_ver = "outputs/lizard/paper_figure_teaser/ver"
                     
+                #     os.makedirs(pth_img, exist_ok=True)
+                #     os.makedirs(pth_lbl, exist_ok=True)
+                #     os.makedirs(pth_hor, exist_ok=True)
+                #     os.makedirs(pth_ver, exist_ok=True)
+
                 #     Image.fromarray(_img).save(os.path.join(pth_img, fn))
                 #     Image.fromarray(_lbl).save(os.path.join(pth_lbl, fn))
+                #     tifffile.imwrite(os.path.join(pth_hor, fn_tif), _hor)
+                #     tifffile.imwrite(os.path.join(pth_ver, fn_tif), _ver)
                 # exit()
+                
 
+        img = torch.cat((img, dist), dim=1)
+        
         img.clamp_(-1., 1.)
 
         # final inpainting
@@ -1522,12 +1663,15 @@ class JointImagen(nn.Module):
 
         unnormalize_img = self.unnormalize_img(img)
         lbl = log_onehot_to_index(log_lbl)
+
+
         return unnormalize_img, lbl
 
     @torch.no_grad()
     @eval_decorator
     def sample(
         self,
+        point = None,
         texts: List[str] = None,
         text_masks=None,
         text_embeds=None,
@@ -1640,10 +1784,11 @@ class JointImagen(nn.Module):
         # go through each unet in cascade
 
         for unet_number, unet, channel, image_size, noise_scheduler, noise_scheduler_lbl, pred_objective, \
-                dynamic_threshold, unet_cond_scale, unet_init_images, unet_init_labels, unet_skip_steps \
+                dynamic_threshold, unet_cond_scale, unet_init_images, unet_init_labels, unet_skip_steps, noise_scheduler_2 \
         in tqdm(zip(range(1, num_unets + 1), self.unets, self.sample_channels, self.image_sizes,
                     self.noise_schedulers_sample, self.noise_schedulers_lbl_sample, self.pred_objectives,
-                    self.dynamic_thresholding, cond_scale, init_images, init_labels, skip_steps),
+                    self.dynamic_thresholding, cond_scale, init_images, init_labels, skip_steps,
+                    self.noise_schedulers_2_sample),
                     disable=not use_tqdm):
 
             if unet_number < start_at_unet_number:
@@ -1682,6 +1827,7 @@ class JointImagen(nn.Module):
                 img, lbl = self.p_sample_loop(
                     unet,
                     shape,
+                    point=point,
                     text_embeds=text_embeds,
                     text_mask=text_masks,
                     cond_images=cond_images,
@@ -1697,13 +1843,14 @@ class JointImagen(nn.Module):
                     lowres_cond_lbl=lowres_cond_lbl,
                     lowres_noise_times=lowres_noise_times,
                     noise_scheduler=noise_scheduler,
+                    noise_scheduler_2=noise_scheduler_2,
                     noise_scheduler_lbl=noise_scheduler_lbl,
                     pred_objective=pred_objective,
                     dynamic_threshold=dynamic_threshold,
                     use_tqdm=use_tqdm
                 )
 
-                outputs.append((img.cpu(), lbl.cpu()))
+                outputs.append((img.cpu(), lbl.cpu(), point.cpu()))
 
             if exists(stop_at_unet_number) and stop_at_unet_number == unet_number:
                 break
@@ -1729,10 +1876,12 @@ class JointImagen(nn.Module):
         self,
         unet: Union[JointUnet, Unet3D, NullUnet, DistributedDataParallel],
         x_start,
+        dist_start,
         lbl_start,
         times,
         *,
         noise_scheduler: GaussianDiffusionContinuousTimes,
+        noise_scheduler_2: GaussianDiffusionContinuousTimes,
         noise_scheduler_lbl: MultinomialDiffusion,
         lowres_cond_img=None,
         lowres_cond_lbl=None,
@@ -1741,48 +1890,53 @@ class JointImagen(nn.Module):
         text_mask=None,
         cond_images=None,
         noise=None,
+        noise_2=None,
         noise_lbl=None,
         times_next=None,
         pred_objective='noise',
         p2_loss_weight_gamma=0.,
-        random_crop_size=None
+        random_crop_size=None,
+        point=None
     ):
         is_video = x_start.ndim == 5
 
         noise = default(noise, lambda: torch.randn_like(x_start))
+        noise_2 = default(noise_2, lambda: torch.randn_like(dist_start))
         # noise_lbl = default(noise_lbl, lambda: torch.randn_like(x_start))  # TODO
 
         # normalize to [-1, 1]
 
         x_start = self.normalize_img(x_start)
+        dist_start = self.normalize_img(dist_start)
         lowres_cond_img = maybe(self.normalize_img)(lowres_cond_img)
 
         # random cropping during training
         # for upsamplers
 
-        if exists(random_crop_size):
-            if is_video:
-                frames = x_start.shape[2]
-                x_start, lowres_cond_img, noise = rearrange_many(
-                    (x_start, lowres_cond_img, noise), 'b c f h w -> (b f) c h w')
+        # if exists(random_crop_size):
+        #     if is_video:
+        #         frames = x_start.shape[2]
+        #         x_start, lowres_cond_img, noise = rearrange_many(
+        #             (x_start, lowres_cond_img, noise), 'b c f h w -> (b f) c h w')
 
-            aug = K.RandomCrop(random_crop_size, p=1.)
+        #     aug = K.RandomCrop(random_crop_size, p=1.)
 
-            # make sure low res conditioner and image both get augmented the same way
-            # detailed https://kornia.readthedocs.io/en/latest/augmentation.module.html?highlight=randomcrop#kornia.augmentation.RandomCrop
-            x_start = aug(x_start)
-            lbl_start = aug(lbl_start, params=aug._params)
-            lowres_cond_img = aug(lowres_cond_img, params=aug._params)
-            lowres_cond_lbl = aug(lowres_cond_lbl, params=aug._params)
-            noise = aug(noise, params=aug._params)
+        #     # make sure low res conditioner and image both get augmented the same way
+        #     # detailed https://kornia.readthedocs.io/en/latest/augmentation.module.html?highlight=randomcrop#kornia.augmentation.RandomCrop
+        #     x_start = aug(x_start)
+        #     lbl_start = aug(lbl_start, params=aug._params)
+        #     lowres_cond_img = aug(lowres_cond_img, params=aug._params)
+        #     lowres_cond_lbl = aug(lowres_cond_lbl, params=aug._params)
+        #     noise = aug(noise, params=aug._params)
 
-            if is_video:
-                x_start, lowres_cond_img, noise = rearrange_many(
-                    (x_start, lowres_cond_img, noise), '(b f) c h w -> b c f h w', f=frames)
+        #     if is_video:
+        #         x_start, lowres_cond_img, noise = rearrange_many(
+        #             (x_start, lowres_cond_img, noise), '(b f) c h w -> b c f h w', f=frames)
 
         # get x_t
 
         x_noisy, log_snr = noise_scheduler.q_sample(x_start=x_start, t=times, noise=noise)
+        dist_noisy, log_snr_2 = noise_scheduler_2.q_sample(x_start=dist_start, t=times, noise=noise_2)
         log_lbl_start = index_to_log_onehot(lbl_start.long(), self.num_classes)
         log_lbl_noisy = noise_scheduler_lbl.q_sample(log_lbl_start, t=times)
         lbl_noisy = log_onehot_to_index(log_lbl_noisy)
@@ -1826,10 +1980,12 @@ class JointImagen(nn.Module):
 
         if self_cond and random() < 0.5:
             with torch.no_grad():
-                pred, pred_lbl = unet.forward(
+                pred, pred_dist, pred_lbl = unet.forward(
                     x_noisy,
+                    dist_noisy,
                     lbl_noisy,
                     noise_cond,
+                    point_map=point,
                     **unet_kwargs
                 ).detach()
                 pred_lbl = F.log_softmax(pred_lbl, dim=1)
@@ -1837,6 +1993,9 @@ class JointImagen(nn.Module):
 
                 x_start = noise_scheduler.predict_start_from_noise(
                     x_noisy, t=times, noise=pred) if pred_objective == 'noise' else pred
+                
+                dist_start = noise_scheduler_2.predict_start_from_noise(
+                    dist_noisy, t=times, noise=pred_dist) if pred_objective == 'noise' else pred_dist
                 # lbl_start = noise_scheduler_lbl.predict_start_from_noise(
                 #     lbl_noisy, t=times, noise=pred_lbl) if pred_objective == 'noise' else pred_lbl # TODO ???
                 lbl_start = None
@@ -1845,10 +2004,12 @@ class JointImagen(nn.Module):
 
         # get prediction
 
-        pred, pred_lbl = unet.forward(
+        pred, pred_dist, pred_lbl = unet.forward(
             x_noisy,
+            dist_noisy,
             lbl_noisy,
             noise_cond,
+            point_map=point,
             **unet_kwargs
         )
         pred_lbl = F.log_softmax(pred_lbl, dim=1)
@@ -1858,8 +2019,10 @@ class JointImagen(nn.Module):
 
         if pred_objective == 'noise':
             target = noise
+            target_2 = noise_2
         elif pred_objective == 'x_start':
             target = x_start
+            target_2 = dist_start
         else:
             raise ValueError(f'unknown objective {pred_objective}')
         target_log_lbl = noise_scheduler_lbl.q_posterior(log_lbl_start, log_lbl_noisy, times)
@@ -1868,6 +2031,8 @@ class JointImagen(nn.Module):
 
         losses = self.loss_fn(pred, target, reduction='none')
         losses = reduce(losses, 'b ... -> b', 'mean')
+        losses_2 = self.loss_fn(pred_dist, target_2, reduction='none')
+        losses_2 = reduce(losses_2, 'b ... -> b', 'mean')
         losses_lbl = noise_scheduler_lbl.loss_fn(target_log_lbl, pred_lbl_post, times, log_lbl_start)
 
         # p2 loss reweighting
@@ -1875,9 +2040,10 @@ class JointImagen(nn.Module):
         if p2_loss_weight_gamma > 0:
             loss_weight = (self.p2_loss_weight_k + log_snr.exp()) ** -p2_loss_weight_gamma
             losses = losses * loss_weight
+            losses_2 = losses_2 * loss_weight
             losses_lbl = losses_lbl * loss_weight
 
-        return losses.mean(), losses_lbl.mean()
+        return losses.mean(), losses_lbl.mean(), losses_2.mean()
 
     def forward(
         self,
@@ -1888,7 +2054,8 @@ class JointImagen(nn.Module):
         text_embeds=None,
         text_masks=None,
         unet_number=None,
-        cond_images=None
+        cond_images=None,
+        points=None
     ):
         # assert images.shape[-1] == images.shape[-2], \
         #     f'the images you pass in must be a square, but received dimensions of {images.shape[2]}, {images.shape[-1]}'
@@ -1898,7 +2065,9 @@ class JointImagen(nn.Module):
         assert not exists(self.only_train_unet_number) or self.only_train_unet_number == unet_number, \
             'you can only train on unet #{self.only_train_unet_number}'
 
-        images = cast_uint8_images_to_float(images)
+        img_dist = cast_uint8_images_to_float(images)
+        images = img_dist[:,:3,:,:]
+        dists = img_dist[:,3:,:]
         cond_images = maybe(cast_uint8_images_to_float)(cond_images)
 
         assert is_float_dtype(images.dtype), f'images tensor needs to be floats but {images.dtype} dtype found instead'
@@ -1910,6 +2079,7 @@ class JointImagen(nn.Module):
         assert not isinstance(unet, NullUnet), 'null unet cannot and should not be trained'
 
         noise_scheduler = self.noise_schedulers[unet_index]
+        noise_scheduler_2 = self.noise_schedulers_2[unet_index]
         noise_scheduler_lbl = self.noise_schedulers_lbl[unet_index]
         p2_loss_weight_gamma = self.p2_loss_weight_gamma[unet_index]
         pred_objective = self.pred_objectives[unet_index]
@@ -1962,6 +2132,9 @@ class JointImagen(nn.Module):
                 lowres_aug_times = repeat(lowres_aug_time, '1 -> b', b=b)
 
         images = self.resize_to(images, target_image_size)
+        dists = self.resize_to(dists, target_image_size)
         labels = self.resize_to(labels, target_image_size)
+        points = self.resize_to(points, target_image_size)
 
-        return self.p_losses(unet, images, labels, times, text_embeds=text_embeds, text_mask=text_masks, cond_images=cond_images, noise_scheduler=noise_scheduler, noise_scheduler_lbl=noise_scheduler_lbl, lowres_cond_img=lowres_cond_img, lowres_cond_lbl=lowres_cond_lbl, lowres_aug_times=lowres_aug_times, pred_objective=pred_objective, p2_loss_weight_gamma=p2_loss_weight_gamma, random_crop_size=random_crop_size)
+        return self.p_losses(unet, images, dists, labels, times, text_embeds=text_embeds, text_mask=text_masks, cond_images=cond_images, noise_scheduler=noise_scheduler, noise_scheduler_2=noise_scheduler_2, noise_scheduler_lbl=noise_scheduler_lbl, lowres_cond_img=lowres_cond_img, lowres_cond_lbl=lowres_cond_lbl, lowres_aug_times=lowres_aug_times, pred_objective=pred_objective, p2_loss_weight_gamma=p2_loss_weight_gamma, random_crop_size=random_crop_size,
+                             point=points)
