@@ -152,7 +152,7 @@ class LizardDataset(Dataset):
         self.points = sorted([osp.join(self.point_dir, file) for file in os.listdir(self.point_dir)
                               if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
         self.dists = sorted([osp.join(self.dist_dir, file) for file in os.listdir(self.dist_dir)
-                              if "." in file and file.split(".")[-1].lower() in ["jpg", "jpeg", "png", "gif"]])
+                              if "." in file and file.split(".")[-1].lower() in ["npy"]])
 
         assert len(self.images) == len(self.labels) == len(self.points) == len(self.dists), f'{len(self.images)} != {len(self.labels)} != {len(self.points)} != {len(self.dists)}'
         for img, lbl, pnt, dist in zip(self.images, self.labels, self.points, self.dists):
@@ -205,7 +205,7 @@ class LizardDataset(Dataset):
             original_pil_image  = Image.open(self.images[idx]).convert("RGB")
             original_pil_target = Image.open(self.labels[idx])
             original_pil_point  = Image.open(self.points[idx])
-            original_pil_dist     = Image.open(self.dists[idx])
+            original_npy_dist   = np.load(self.dists[idx])
         except (OSError, ValueError) as e:
             print(f"An exception occurred trying to load file {self.images[idx]}.")
             print(f"Skipping index {idx}")
@@ -215,7 +215,7 @@ class LizardDataset(Dataset):
         image = ToTensor()(original_pil_image)
         label = ToTensorNoNorm()(original_pil_target).float()
         point = ToTensorNoNorm()(original_pil_point).float()
-        dist = ToTensor()(original_pil_dist).float()
+        dist = ToTensorNoNorm()(original_npy_dist).float()
         img_dist_lbl_pnt = self.augmentation(torch.cat([image, dist, label, point])) # 0,1,2: image, 3: dist, 4: label, 5:point
         
         aug_img_dist = img_dist_lbl_pnt[:4]
