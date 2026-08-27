@@ -9,6 +9,9 @@ This repository contains the official implementation of the paper:
 
 ## News
 
+Aug. 27, 2026
+- **The pretrained checkpoints are currently unavailable.** The download link has been taken down and we are working on restoring it. Please see the [Checkpoints](#checkpoints) section below.
+
 Feb. 17, 2025
 - Updated train.py, test.py , datasets/, imagen_pytorch/ directories
 - Uploaded python code for creating both point centroids (.png) and distance maps (.npy): preprocess/generate_point_and_distmap.py
@@ -34,10 +37,16 @@ pip install -r requirements.txt
 
 ## Checkpoints
 
-[Checkpoints](https://drive.google.com/drive/folders/15ZN6AYDChWQNrSCBE6bVK9vbz3kytzM5?usp=drive_link)
+> [!IMPORTANT]
+> **The pretrained checkpoints are currently NOT available.**
+> The previously shared Google Drive link is no longer accessible, so the checkpoints below cannot be downloaded at this time. We are working on restoring access and will update this section once they are available again.
+
+Checkpoints that were previously released (currently unavailable):
 - lizard
 - endonuke
 - pannuke
+
+In the meantime, the models can be trained from scratch using `train.py` (see the [Installation](#installation) section for environment setup).
 
 ## Acknowledgements
 
